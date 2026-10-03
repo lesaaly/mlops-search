@@ -11,6 +11,7 @@ permissions:
   packages: write
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   HELM_DRIVER: configmap
   KUBE_NAMESPACE: mlops-students
   IMAGE_REPOSITORY: ghcr.io/lesaaly/runbook-search-api
