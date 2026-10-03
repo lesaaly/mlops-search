@@ -1,0 +1,43 @@
+stages: [test, quality, build, deploy, promote]
+
+variables:
+  KUBE_NAMESPACE: mlops-students
+  HELM_DRIVER: configmap
+  # TODO(student): задайте уникальные release names с выданным префиксом.
+
+unit-and-quality:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - pip install -r requirements.txt
+    - python scripts/build_index.py --output artifacts
+    - pytest -q
+    - python scripts/evaluate.py --artifact-dir artifacts
+
+negative-quality-control:
+  stage: quality
+  image: python:3.12-slim
+  script:
+    # TODO(student): job успешен только если плохой кандидат заблокирован.
+    - python -c 'print("TODO: verify reverse candidate fails")'
+
+build-image:
+  stage: build
+  script:
+    # TODO(student): rootless BuildKit, push commit tag, затем immutable digest.
+    - echo TODO
+
+deploy-staging:
+  stage: deploy
+  resource_group: mlops-search-staging
+  script:
+    # TODO(student): Helm 4 upgrade --install по digest, wait и внешний smoke test.
+    - echo TODO
+
+promote-production:
+  stage: promote
+  resource_group: mlops-search-production
+  when: manual
+  script:
+    # TODO(student): тот же digest и rollback при провале HTTP-проверки.
+    - echo TODO

@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Generated ML artifacts
+artifacts/
+
+# Environment / secrets
+.env
+.env.*
+*.kubeconfig
+kubeconfig
+*.pem
+*.key
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Temporary files
+*.log
+*.tmp

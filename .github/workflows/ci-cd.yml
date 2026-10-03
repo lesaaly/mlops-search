@@ -1,0 +1,242 @@
+name: mlops-search-ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  HELM_DRIVER: configmap
+  KUBE_NAMESPACE: mlops-students
+  IMAGE_REPOSITORY: ghcr.io/lesaaly/runbook-search-api
+  STAGING_RELEASE: lesina-search-staging
+  PRODUCTION_RELEASE: lesina-search-prod
+
+concurrency:
+  group: mlops-search-deployment
+  cancel-in-progress: false
+
+jobs:
+  test-quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build index
+        run: python scripts/build_index.py --output artifacts
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Quality gate
+        run: |
+          python scripts/evaluate.py \
+            --artifact-dir artifacts | tee quality-report.json
+
+      - name: Negative quality control
+        run: |
+          set +e
+          python scripts/evaluate.py \
+            --artifact-dir artifacts \
+            --ranking-mode reverse > reverse-quality-report.txt 2>&1
+          status=$?
+          set -e
+
+          cat reverse-quality-report.txt
+
+          if [ "$status" -eq 0 ]; then
+            echo "ERROR: reverse quality control unexpectedly passed"
+            exit 1
+          fi
+
+          echo "Reverse candidate correctly rejected."
+
+      - name: Upload quality artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-reports
+          path: |
+            artifacts/metadata.json
+            quality-report.json
+            reverse-quality-report.txt
+
+  build:
+    needs: test-quality
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_REPOSITORY }}:${{ github.sha }}
+
+      - name: Show immutable digest
+        run: |
+          echo "Image repository: $IMAGE_REPOSITORY"
+          echo "Image digest: ${{ steps.build.outputs.digest }}"
+
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure kubeconfig
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "$KUBE_CONFIG_B64" | base64 --decode > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Deploy staging
+        run: |
+          helm upgrade --install "$STAGING_RELEASE" helm/mlops-search \
+            --namespace "$KUBE_NAMESPACE" \
+            --set image.repository="$IMAGE_REPOSITORY" \
+            --set image.digest="${{ needs.build.outputs.digest }}" \
+            --set environment=staging \
+            --set buildRevision="${{ github.sha }}" \
+            --set rankingMode=normal \
+            --wait \
+            --timeout 3m
+
+      - name: Helm test staging
+        run: |
+          helm test "$STAGING_RELEASE" \
+            --namespace "$KUBE_NAMESPACE" \
+            --logs
+
+      - name: Semantic smoke staging
+        run: |
+          python3 scripts/verify_release.py \
+            --release "$STAGING_RELEASE" \
+            --namespace "$KUBE_NAMESPACE" \
+            --port 18090
+
+      - name: Rollback staging on failure
+        if: failure()
+        run: |
+          REVISION=$(helm history "$STAGING_RELEASE" \
+            -n "$KUBE_NAMESPACE" \
+            -o json | python3 -c \
+            'import json,sys; h=json.load(sys.stdin); print(h[-2]["revision"] if len(h) >= 2 else "")')
+
+          if [ -n "$REVISION" ]; then
+            echo "Rolling staging back to revision $REVISION"
+            helm rollback "$STAGING_RELEASE" "$REVISION" \
+              -n "$KUBE_NAMESPACE" \
+              --wait \
+              --timeout 3m
+          else
+            echo "No previous staging revision available."
+          fi
+
+  promote-production:
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure kubeconfig
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "$KUBE_CONFIG_B64" | base64 --decode > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Deploy production
+        run: |
+          helm upgrade --install "$PRODUCTION_RELEASE" helm/mlops-search \
+            --namespace "$KUBE_NAMESPACE" \
+            --set image.repository="$IMAGE_REPOSITORY" \
+            --set image.digest="${{ needs.build.outputs.digest }}" \
+            --set environment=production \
+            --set buildRevision="${{ github.sha }}" \
+            --set rankingMode=normal \
+            --wait \
+            --timeout 3m
+
+      - name: Helm test production
+        run: |
+          helm test "$PRODUCTION_RELEASE" \
+            --namespace "$KUBE_NAMESPACE" \
+            --logs
+
+      - name: Semantic smoke production
+        run: |
+          python3 scripts/verify_release.py \
+            --release "$PRODUCTION_RELEASE" \
+            --namespace "$KUBE_NAMESPACE" \
+            --port 18091
+
+      - name: Rollback production on failure
+        if: failure()
+        run: |
+          REVISION=$(helm history "$PRODUCTION_RELEASE" \
+            -n "$KUBE_NAMESPACE" \
+            -o json | python3 -c \
+            'import json,sys; h=json.load(sys.stdin); print(h[-2]["revision"] if len(h) >= 2 else "")')
+
+          if [ -n "$REVISION" ]; then
+            echo "Rolling production back to revision $REVISION"
+            helm rollback "$PRODUCTION_RELEASE" "$REVISION" \
+              -n "$KUBE_NAMESPACE" \
+              --wait \
+              --timeout 3m
+
+            echo "Verifying restored production..."
+            python3 scripts/verify_release.py \
+              --release "$PRODUCTION_RELEASE" \
+              --namespace "$KUBE_NAMESPACE" \
+              --port 18091
+          else
+            echo "No previous production revision available."
+          fi
