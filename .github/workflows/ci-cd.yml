@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      ranking_mode:
+        description: "Production ranking mode (reverse = rollback demo)"
+        required: false
+        default: "normal"
+        type: choice
+        options:
+          - normal
+          - reverse
 
 permissions:
   contents: read
@@ -193,6 +202,22 @@ jobs:
       - name: Setup Helm
         uses: azure/setup-helm@v4
 
+      - name: Record last good production revision
+        id: last_good
+        run: |
+          REVISION=$(helm history "$PRODUCTION_RELEASE" \
+            -n "$KUBE_NAMESPACE" \
+            -o json | python3 -c \
+            'import json,sys; h=json.load(sys.stdin); print(h[-1]["revision"] if h else "")')
+
+          if [ -z "$REVISION" ]; then
+            echo "ERROR: no existing production revision found"
+            exit 1
+          fi
+
+          echo "Last good production revision: $REVISION"
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+
       - name: Deploy production
         run: |
           helm upgrade --install "$PRODUCTION_RELEASE" helm/mlops-search \
@@ -201,7 +226,7 @@ jobs:
             --set image.digest="${{ needs.build.outputs.digest }}" \
             --set environment=production \
             --set buildRevision="${{ github.sha }}" \
-            --set rankingMode=normal \
+            --set rankingMode="${{ github.event.inputs.ranking_mode || 'normal' }}" \
             --wait \
             --timeout 5m
 
@@ -211,33 +236,44 @@ jobs:
             --namespace "$KUBE_NAMESPACE" \
             --logs
 
-      - name: Semantic smoke production
+      - name: Semantic smoke production with rollback
         run: |
+          set +e
+
           python3 scripts/verify_release.py \
             --release "$PRODUCTION_RELEASE" \
             --namespace "$KUBE_NAMESPACE" \
             --port 18091
 
-      - name: Rollback production on failure
-        if: failure()
-        run: |
-          REVISION=$(helm history "$PRODUCTION_RELEASE" \
-            -n "$KUBE_NAMESPACE" \
-            -o json | python3 -c \
-            'import json,sys; h=json.load(sys.stdin); print(h[-2]["revision"] if len(h) >= 2 else "")')
+          SMOKE_STATUS=$?
+          set -e
 
-          if [ -n "$REVISION" ]; then
-            echo "Rolling production back to revision $REVISION"
-            helm rollback "$PRODUCTION_RELEASE" "$REVISION" \
-              -n "$KUBE_NAMESPACE" \
-              --wait \
-              --timeout 5m
-
-            echo "Verifying restored production..."
-            python3 scripts/verify_release.py \
-              --release "$PRODUCTION_RELEASE" \
-              --namespace "$KUBE_NAMESPACE" \
-              --port 18091
-          else
-            echo "No previous production revision available."
+          if [ "$SMOKE_STATUS" -eq 0 ]; then
+            echo "Semantic smoke passed."
+            exit 0
           fi
+
+          echo "Semantic smoke FAILED."
+          echo "Rolling back to last good revision: ${{ steps.last_good.outputs.revision }}"
+
+          helm rollback "$PRODUCTION_RELEASE" \
+            "${{ steps.last_good.outputs.revision }}" \
+            -n "$KUBE_NAMESPACE" \
+            --wait \
+            --timeout 5m
+
+          echo "Rollback completed."
+          echo "Re-running semantic smoke after rollback..."
+
+          python3 scripts/verify_release.py \
+            --release "$PRODUCTION_RELEASE" \
+            --namespace "$KUBE_NAMESPACE" \
+            --port 18091
+
+          echo "Rollback verified: semantic smoke passed after rollback."
+
+      - name: Show production history
+        if: always()
+        run: |
+          helm history "$PRODUCTION_RELEASE" \
+            -n "$KUBE_NAMESPACE"
