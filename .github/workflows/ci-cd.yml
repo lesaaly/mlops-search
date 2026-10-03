@@ -140,7 +140,7 @@ jobs:
             --set buildRevision="${{ github.sha }}" \
             --set rankingMode=normal \
             --wait \
-            --timeout 3m
+            --timeout 5m
 
       - name: Helm test staging
         run: |
@@ -168,7 +168,7 @@ jobs:
             helm rollback "$STAGING_RELEASE" "$REVISION" \
               -n "$KUBE_NAMESPACE" \
               --wait \
-              --timeout 3m
+              --timeout 5m
           else
             echo "No previous staging revision available."
           fi
@@ -203,7 +203,7 @@ jobs:
             --set buildRevision="${{ github.sha }}" \
             --set rankingMode=normal \
             --wait \
-            --timeout 3m
+            --timeout 5m
 
       - name: Helm test production
         run: |
@@ -231,7 +231,7 @@ jobs:
             helm rollback "$PRODUCTION_RELEASE" "$REVISION" \
               -n "$KUBE_NAMESPACE" \
               --wait \
-              --timeout 3m
+              --timeout 5m
 
             echo "Verifying restored production..."
             python3 scripts/verify_release.py \
